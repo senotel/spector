@@ -1,0 +1,211 @@
+<!doctype html>
+<!-- Vision Spector: the watch page. Plays the Shorts in feed.json in YouTube's
+     own embedded player and records how they were watched: how long, where the
+     viewer left, rewatches, likes, and sometimes why they swiped early.
+     Two ways to run:
+     - local (serve.js): views go to /spector/log -> data/views.jsonl;
+     - hosted (the public link): `node spector.cjs site` writes site/index.html
+       with SPECTOR set below, and views go to the Supabase table spector_events
+       (insert only; nobody can read it with this page's key).
+     Our controls sit below the player, never over it (YouTube's embed rules). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vision Spector</title>
+<style>
+:root { --bg: #101114; --fg: #ececee; --muted: #a3a5ab; --rule: #2f3136; --crimson: #BA163F; --pink: #F04C70; }
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 400 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+body { display: flex; flex-direction: column; height: 100dvh; overscroll-behavior: none; }
+#stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 8px 8px 0; }
+#frame { height: 100%; aspect-ratio: 9 / 16; max-width: 100%; background: #000; }
+#frame iframe { width: 100%; height: 100%; border: 0; display: block; }
+#bar { display: flex; align-items: center; gap: 10px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); border-top: 1px solid var(--rule); touch-action: none; }
+button { font: inherit; color: var(--fg); background: transparent; border: 1px solid var(--rule); border-radius: 4px; padding: 12px 16px; cursor: pointer; }
+button:focus-visible { outline: 2px solid var(--pink); outline-offset: 2px; }
+#like[aria-pressed="true"] { border-color: var(--pink); color: var(--pink); }
+#next { margin-left: auto; background: var(--crimson); border-color: var(--crimson); color: #fff; font-weight: 600; min-width: 110px; }
+#info { color: var(--muted); font-size: 13px; flex: 1; min-width: 0; }
+#why { display: none; flex: 1; gap: 6px; flex-wrap: wrap; align-items: center; }
+#why.on { display: flex; } #why.on ~ #info { display: none; }
+#why span { color: var(--muted); font-size: 13px; margin-right: 2px; }
+#why button { padding: 7px 10px; font-size: 13px; }
+#start { position: fixed; inset: 0; background: var(--bg); display: flex; flex-direction: column; justify-content: center; padding: 24px; max-width: 520px; margin: 0 auto; }
+#start h1 { font-size: 24px; margin: 0 0 12px; } #start p { color: var(--muted); margin: 0 0 12px; }
+#start button { margin-top: 12px; background: var(--crimson); border-color: var(--crimson); color: #fff; font-weight: 600; align-self: flex-start; }
+#start .err { color: var(--pink); }
+</style>
+</head>
+<body>
+<div id="stage"><div id="frame"><div id="player"></div></div></div>
+<div id="bar">
+  <button id="like" aria-pressed="false" title="Like (L)">Like</button>
+  <div id="why" role="group" aria-label="Why did you swipe?"><span>Why?</span>
+    <button data-r="boring">Boring</button><button data-r="slow start">Slow start</button><button data-r="confusing">Confusing</button>
+    <button data-r="not my topic">Not my topic</button><button data-r="annoying audio">Audio</button><button data-r="seen it">Seen it</button></div>
+  <div id="info" aria-live="polite"></div>
+  <button id="next" title="Next (Down arrow or N)">Next</button>
+</div>
+<div id="start">
+  <h1>Vision Spector</h1>
+  <p>Watch the way you normally watch Shorts. Press <b>Next</b> (or swipe up on the bar, or the Down arrow) the moment you would swipe away. Let a video loop if you would rewatch it. Press <b>Like</b> if you would like it.</p>
+  <p>Sometimes, after an early swipe, it asks why. Tap a reason or ignore it.</p>
+  <div id="consent" hidden>
+    <p>This page is Senotel research. It records which videos you watch, for how long, what you like and why you swipe, to train Senotel's AI to understand what people enjoy. No account, no name unless you add one, nothing else about you. For ages 13 and up.</p>
+    <p><label>Nickname (optional, so we can tell viewers apart): <input id="nick" maxlength="24" autocomplete="off" style="font:inherit;background:transparent;color:inherit;border:1px solid var(--rule);border-radius:4px;padding:8px;width:12em"></label></p>
+  </div>
+  <p id="msg"></p>
+  <button id="go" disabled>Loading</button>
+</div>
+<script>
+"use strict";
+const SPECTOR = {"url":"https://wzfnbgpcnsdswnuwgbai.supabase.co","key":"sb_publishable_FKpl9cjeRsXk-heFujJEig_d6t-n3mL"};   // hosted copies get {url, key} for Supabase here (node spector.cjs site)
+const REMOTE = !!(SPECTOR && SPECTOR.url);
+const DATA = REMOTE ? "" : "data/";
+const $ = (id) => document.getElementById(id);
+let queue = [], cur = null, player = null, timer = 0, todayCount = 0, early = 0, whyFor = null, whyTimer = 0;
+const store = { get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} } };
+/* each device gets a random id; no name unless the viewer types a nickname */
+const viewer = store.get("spector-viewer", "") || (() => { const v = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2)); store.set("spector-viewer", v); return v; })();
+
+/* a view in progress */
+function fresh(item) { return { item, watched: 0, last: null, maxPos: 0, loops: 0, liked: false, began: 0, playing: false, duration: 0 }; }
+
+async function send(r) {
+  if (!REMOTE) return fetch("/spector/log", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(r) });
+  return fetch(SPECTOR.url + "/rest/v1/spector_events", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", apikey: SPECTOR.key, Authorization: "Bearer " + SPECTOR.key, Prefer: "return=minimal" },
+    body: JSON.stringify({ viewer, nickname: store.get("spector-nick", "") || null, kind: r.kind, video_id: r.id, data: r })
+  });
+}
+async function post(rec) {
+  if (rec.id) { const seen = store.get("spector-seen", []); seen.push(rec.id); store.set("spector-seen", seen.slice(-20000)); }
+  const pending = store.get("spector-pending", []);
+  pending.push(rec);
+  const keep = [];
+  for (const r of pending) {
+    try { const res = await send(r); if (!res.ok) throw 0; }
+    catch (e) { keep.push(r); }
+  }
+  store.set("spector-pending", keep);
+  if (keep.length) $("info").textContent = keep.length + " not saved yet" + (REMOTE ? " (offline?)" : " (is serve.js running?)");
+}
+
+/* the same order for everyone on the same day, so friends watch many of the same
+   videos and Spector sees how different people react to one video */
+function seeded(seed) { let h = 2166136261; for (const c of seed) h = Math.imul(h ^ c.charCodeAt(0), 16777619); return () => { h += 0x6D2B79F5; let t = h; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function shuffleByNiche(items) {
+  const rnd = seeded(new Date().toISOString().slice(0, 10));
+  const by = {};
+  items.forEach((it) => (by[it.niche] = by[it.niche] || []).push(it));
+  const lists = Object.keys(by).sort().map((k) => by[k]);
+  lists.forEach((a) => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } });
+  const out = [];
+  while (lists.some((a) => a.length)) { for (let i = lists.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [lists[i], lists[j]] = [lists[j], lists[i]]; } lists.forEach((a) => a.length && out.push(a.pop())); }
+  return out;
+}
+
+async function load() {
+  let feed;
+  const seen = new Set(store.get("spector-seen", []));
+  if (REMOTE) { $("consent").hidden = false; $("nick").value = store.get("spector-nick", ""); }
+  try { feed = await (await fetch(DATA + "feed.json", { cache: "no-store" })).json(); }
+  catch (e) { $("msg").innerHTML = '<span class="err">No feed yet. Run <code>node spector.cjs feed</code> first.</span>'; return; }
+  if (!REMOTE) try {
+    const t = await (await fetch(DATA + "views.jsonl", { cache: "no-store" })).text();
+    t.split("\n").filter(Boolean).forEach((l) => { try { const r = JSON.parse(l); if (r.id) seen.add(r.id); if (r.kind === "view" && r.at && r.at.slice(0, 10) === new Date().toISOString().slice(0, 10)) todayCount++; } catch (e) {} });
+  } catch (e) {}
+  queue = shuffleByNiche(feed.items.filter((it) => !seen.has(it.id)));
+  $("msg").textContent = queue.length + " videos waiting.";
+  if (!queue.length) return;
+  const s = document.createElement("script"); s.src = "https://www.youtube.com/iframe_api"; document.head.appendChild(s);
+}
+
+window.onYouTubeIframeAPIReady = () => { $("go").disabled = false; $("go").textContent = "Start watching"; };
+
+function start() {
+  if (REMOTE) store.set("spector-nick", $("nick").value.trim().slice(0, 24));
+  $("start").remove();
+  cur = fresh(queue.shift());
+  player = new YT.Player("player", {
+    videoId: cur.item.id,
+    playerVars: { autoplay: 1, playsinline: 1, rel: 0, controls: 1, origin: location.origin },
+    events: { onStateChange: onState, onError: onError, onReady: () => player.playVideo() }
+  });
+  timer = setInterval(tick, 250);
+  info();
+}
+
+function onState(e) {
+  if (!cur) return;
+  cur.playing = e.data === YT.PlayerState.PLAYING;
+  if (cur.playing && !cur.began) cur.began = performance.now();
+  if (e.data === YT.PlayerState.ENDED) { cur.loops++; cur.last = 0; player.seekTo(0, true); player.playVideo(); }  // loops like the apps do
+}
+function onError(e) { if (cur) { post({ kind: "unplayable", id: cur.item.id, code: e.data, at: new Date().toISOString() }); advance(false); } }
+
+function tick() {
+  if (!cur || !cur.playing || !player.getCurrentTime) return;
+  const t = player.getCurrentTime();
+  if (!cur.duration) cur.duration = player.getDuration() || 0;
+  if (cur.last != null && t > cur.last && t - cur.last < 1.5) cur.watched += t - cur.last;
+  // some phones loop the video inside the player without an "ended" event: a jump from
+  // the last second back to the start is a rewatch too
+  if (cur.last != null && cur.duration && t < 1.5 && cur.last > cur.duration - 1.5) { cur.watched += Math.max(0, cur.duration - cur.last); cur.loops++; }
+  cur.last = t;
+  cur.maxPos = Math.max(cur.maxPos, t);
+}
+
+function advance(record) {
+  if (!cur) return;
+  if (record && cur.began) {
+    const d = cur.duration || player.getDuration() || 0;
+    const rec = { kind: "view", id: cur.item.id, niche: cur.item.niche, order: cur.item.order, at: new Date().toISOString(),
+      watched: +cur.watched.toFixed(2), duration: +d.toFixed(2), fraction: d ? +(cur.watched / d).toFixed(3) : null,
+      leftAt: +(player.getCurrentTime() || 0).toFixed(2), maxPos: +cur.maxPos.toFixed(2), loops: cur.loops, liked: cur.liked,
+      wallSec: +((performance.now() - cur.began) / 1000).toFixed(1), device: matchMedia("(pointer: coarse)").matches ? "phone" : "desktop" };
+    post(rec);
+    todayCount++;
+    // sometimes ask why, only after an early swipe, never twice in a row
+    if (rec.fraction != null && rec.fraction < 0.6 && !rec.loops && ++early % 3 === 1) ask(rec);
+  }
+  if (!queue.length) { player.stopVideo(); $("info").textContent = "That is everything in the feed. Run node spector.cjs feed for more."; cur = null; return; }
+  cur = fresh(queue.shift());
+  $("like").setAttribute("aria-pressed", "false");
+  player.loadVideoById(cur.item.id);
+  info();
+}
+
+function ask(rec) {
+  whyFor = rec; $("why").classList.add("on");
+  clearTimeout(whyTimer); whyTimer = setTimeout(() => { $("why").classList.remove("on"); whyFor = null; }, 5000);
+}
+$("why").addEventListener("click", (e) => {
+  const r = e.target.closest("button"); if (!r || !whyFor) return;
+  post({ kind: "reason", id: whyFor.id, viewAt: whyFor.at, reason: r.dataset.r });
+  $("why").classList.remove("on"); whyFor = null;
+});
+
+function info() { $("info").textContent = todayCount + " watched today, " + queue.length + " left"; }
+function like() { if (!cur) return; cur.liked = !cur.liked; $("like").setAttribute("aria-pressed", String(cur.liked)); }
+
+$("go").onclick = start;
+$("next").onclick = () => advance(true);
+$("like").onclick = like;
+addEventListener("keydown", (e) => {
+  if (!player) return;
+  if (e.key === "ArrowDown" || e.key === "n" || e.key === "N") { e.preventDefault(); advance(true); }
+  if (e.key === "l" || e.key === "L") like();
+});
+/* swipe up on the bar = next */
+let y0 = null;
+$("bar").addEventListener("touchstart", (e) => { y0 = e.touches[0].clientY; }, { passive: true });
+$("bar").addEventListener("touchend", (e) => { if (y0 != null && y0 - e.changedTouches[0].clientY > 40) advance(true); y0 = null; });
+/* leaving the tab pauses, so time away is not counted as watching */
+document.addEventListener("visibilitychange", () => { if (document.hidden && player && player.pauseVideo) player.pauseVideo(); });
+load();
+</script>
+</body>
+</html>
